@@ -32,7 +32,6 @@ import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
 import { ConfigPlugin } from "./plugin"
-import { ConfigVariable } from "./variable"
 import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 
@@ -61,6 +60,83 @@ function normalizeLoadedConfig(data: unknown) {
   return copy
 }
 
+type ParseSource =
+  | {
+      type: "path"
+      path: string
+    }
+  | {
+      type: "virtual"
+      source: string
+      dir: string
+    }
+
+type SubstituteInput = ParseSource & {
+  text: string
+  missing?: "error" | "empty"
+  env?: Record<string, string>
+}
+
+function substituteSource(input: ParseSource) {
+  return input.type === "path" ? input.path : input.source
+}
+
+function substituteDir(input: ParseSource) {
+  return input.type === "path" ? path.dirname(input.path) : input.dir
+}
+
+async function substituteConfigText(input: SubstituteInput) {
+  const missing = input.missing ?? "error"
+  const text = input.text.replace(/\{env:([^}]+)\}/g, (_, varName) => {
+    return (input.env?.[varName] ?? process.env[varName]) || ""
+  })
+
+  const fileMatches = Array.from(text.matchAll(/\{file:[^}]+\}/g))
+  if (!fileMatches.length) return text
+
+  const configDir = substituteDir(input)
+  const configSource = substituteSource(input)
+  let out = ""
+  let cursor = 0
+
+  for (const match of fileMatches) {
+    const token = match[0]
+    const index = match.index!
+    out += text.slice(cursor, index)
+
+    const lineStart = text.lastIndexOf("\n", index - 1) + 1
+    const prefix = text.slice(lineStart, index).trimStart()
+    if (prefix.startsWith("//")) {
+      out += token
+      cursor = index + token.length
+      continue
+    }
+
+    let filePath = token.replace(/^\{file:/, "").replace(/\}$/, "")
+    if (filePath.startsWith("~/")) {
+      filePath = path.join(os.homedir(), filePath.slice(2))
+    }
+
+    const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve(configDir, filePath)
+    const fileContent = (
+      await fsNode.readFile(resolvedPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (missing === "empty") return ""
+        const errMsg = `bad file reference: "${token}"`
+        if (error.code === "ENOENT") {
+          throw new Error(`${configSource}: ${errMsg} ${resolvedPath} does not exist`)
+        }
+        throw new Error(`${configSource}: ${errMsg}`)
+      })
+    ).trim()
+
+    out += JSON.stringify(fileContent).slice(1, -1)
+    cursor = index + token.length
+  }
+
+  out += text.slice(cursor)
+  return out
+}
+
 async function substituteWellKnownRemoteConfig(input: {
   value: unknown
   dir: string
@@ -69,7 +145,7 @@ async function substituteWellKnownRemoteConfig(input: {
 }) {
   if (!isRecord(input.value) || typeof input.value.url !== "string") return undefined
 
-  const url = await ConfigVariable.substitute({
+  const url = await substituteConfigText({
     text: input.value.url,
     type: "virtual",
     dir: input.dir,
@@ -83,7 +159,7 @@ async function substituteWellKnownRemoteConfig(input: {
             .filter((entry): entry is [string, string] => typeof entry[1] === "string")
             .map(async ([key, value]) => [
               key,
-              await ConfigVariable.substitute({
+              await substituteConfigText({
                 text: value,
                 type: "virtual",
                 dir: input.dir,
@@ -217,10 +293,8 @@ export const layer = Layer.effect(
     ) {
       const source = "path" in options ? options.path : options.source
       const expanded = yield* Effect.promise(() =>
-        ConfigVariable.substitute(
-          "path" in options
-            ? { text, type: "path", path: options.path, env }
-            : { text, type: "virtual", ...options, env },
+        substituteConfigText(
+          "path" in options ? { text, type: "path", path: options.path, env } : { text, type: "virtual", ...options, env },
         ),
       )
       const parsed = ConfigParse.jsonc(expanded, source)
@@ -313,6 +387,19 @@ export const layer = Layer.effect(
     const loadInstanceState = Effect.fn("Config.loadInstanceState")(
       function* (ctx: InstanceContext) {
         const auth = yield* authSvc.all().pipe(Effect.orDie)
+        const wellKnown = yield* fs.readJson(path.join(Global.Path.data, "well-known.json")).pipe(Effect.orElseSucceed(() => ({})))
+        const wellKnownEntries = Option.getOrElse(
+          Schema.decodeUnknownOption(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({
+                key: Schema.String,
+                token: Schema.String,
+              }),
+            ),
+          )(wellKnown),
+          () => ({}),
+        )
 
         let result: Info = {}
         const authEnv: Record<string, string> = {}
@@ -352,10 +439,15 @@ export const layer = Layer.effect(
           return mergePluginOrigins(source, next.plugin, kind)
         }
 
-        for (const [key, value] of Object.entries(auth)) {
-          if (value.type === "wellknown") {
-            const url = key.replace(/\/+$/, "")
-            authEnv[value.key] = value.token
+        const wellKnownCredentials = Object.fromEntries([
+          ...Object.entries(auth)
+            .filter((entry): entry is [string, Extract<Auth.Info, { type: "wellknown" }>] => entry[1].type === "wellknown")
+            .map(([url, value]) => [url.replace(/\/+$/, ""), { key: value.key, token: value.token }] as const),
+          ...Object.entries(wellKnownEntries).map(([url, value]) => [url.replace(/\/+$/, ""), value] as const),
+        ])
+
+        for (const [url, value] of Object.entries(wellKnownCredentials)) {
+          authEnv[value.key] = value.token
             const wellknownURL = `${url}/.well-known/opencode`
             yield* Effect.logDebug("fetching remote config", { url: wellknownURL })
             const wellknown = yield* fetchRemoteJson(wellknownURL, undefined, ConfigV1.WellKnown, url)
@@ -391,7 +483,6 @@ export const layer = Layer.effect(
             )
             yield* merge(source, next, "global")
             yield* Effect.logDebug("loaded remote config from well-known", { url })
-          }
         }
 
         const global = Object.keys(authEnv).length ? yield* loadGlobal(authEnv) : yield* getGlobal()

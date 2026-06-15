@@ -1,5 +1,6 @@
 import type { Argv } from "yargs"
 import { Auth } from "../../auth"
+import { AuthWellKnown } from "@opencode-ai/core/auth-well-known"
 import { cmd } from "./cmd"
 import { CliError, effectCmd, fail } from "../effect-cmd"
 import { UI } from "../ui"
@@ -500,35 +501,53 @@ export const ProvidersLogoutCommand = effectCmd({
   instance: false,
   handler: Effect.fn("Cli.providers.logout")(function* (args) {
     const authSvc = yield* Auth.Service
+    const authWellKnown = yield* AuthWellKnown.Service
     const modelsDev = yield* ModelsDev.Service
 
     UI.empty()
-    const credentials: Array<[string, Auth.Info]> = Object.entries(yield* Effect.orDie(authSvc.all()))
+    const credentials = [
+      ...Object.entries(yield* Effect.orDie(authSvc.all()))
+        .filter(([, value]) => value.type !== "wellknown")
+        .map(([key, value]) => ({ key, type: value.type, auth: "provider" as const })),
+      ...Object.keys(yield* Effect.orDie(authWellKnown.all())).map((key) => ({
+        key,
+        type: "wellknown" as const,
+        auth: "wellknown" as const,
+      })),
+    ]
     yield* Prompt.intro("Remove credential")
     if (credentials.length === 0) {
       yield* Prompt.log.error("No credentials found")
       return
     }
     const database = yield* modelsDev.get()
-    const options = credentials.map(([key, value]) => ({
-      label: (database[key]?.name || key) + UI.Style.TEXT_DIM + " (" + value.type + ")",
-      value: key,
+    const options = credentials.map((item) => ({
+      label: (database[item.key]?.name || item.key) + UI.Style.TEXT_DIM + " (" + item.type + ")",
+      value: item.auth + ":" + item.key,
     }))
-    const provider = args.provider
-      ? options.find(
-          (option) =>
-            option.value === args.provider ||
-            database[option.value]?.name?.toLowerCase() === args.provider?.toLowerCase(),
-        )?.value
-      : yield* promptValue(
-          yield* Prompt.autocomplete({
-            message: "Select provider",
-            maxItems: 8,
-            options,
-          }),
+    const selected = yield* Effect.gen(function* () {
+      if (args.provider) {
+        return credentials.find(
+          (item) =>
+            item.key === args.provider ||
+            (item.auth === "provider" && database[item.key]?.name?.toLowerCase() === args.provider?.toLowerCase()),
         )
-    if (!provider) return yield* fail(`Unknown configured provider "${args.provider}"`)
-    yield* Effect.orDie(authSvc.remove(provider))
+      }
+      const selectedValue = yield* promptValue(
+        yield* Prompt.autocomplete({
+          message: "Select provider",
+          maxItems: 8,
+          options,
+        }),
+      )
+      return credentials.find((item) => item.auth + ":" + item.key === selectedValue)
+    })
+    if (!selected) return yield* fail(`Unknown configured provider "${args.provider}"`)
+    if (selected.auth === "wellknown") {
+      yield* Effect.orDie(authWellKnown.remove(selected.key))
+    } else {
+      yield* Effect.orDie(authSvc.remove(selected.key))
+    }
     yield* Prompt.outro("Logout successful")
   }),
 })
